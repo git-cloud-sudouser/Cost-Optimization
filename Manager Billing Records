@@ -1,0 +1,192 @@
+Proposed Solution: Tiered Storage with Hot and Cold Tiers
+----------------------------------------------------------
+
+Architecture Overview
+-----------------------
+We'll implement a tiered storage architecture using:
+
+Hot Tier: Existing database (e.g., PostgreSQL, DynamoDB) for recent/active records.
+
+Cold Tier: Low-cost object storage (e.g., Amazon S3 Glacier Instant Retrieval, Azure Cool Blob) for archived records.
+
+Proxy Layer: A lightweight service to route requests and manage data movement (no API contract changes).
+
+Archival Worker: Scheduled job to move old records to cold storage.
+
+Architecture Diagram:
+------------------------
+
++----------------+     +---------------------+     +-----------------+
+|                |     |                     |     |                 |
+|  API Client    +----->    Proxy Service    +----->   Hot Tier      |
+| (Unmodified)   |     | (Read/Write Router)|     | (Database)      |
++----------------+     +----------+----------+     +--------+--------+
+                                  |                        |
+                                  |                        | Archival
+                                  |                        | Trigger
+                         +--------v----------+     +-------v--------+
+                         |                   |     |                |
+                         |   Cold Tier       <-----+  Archival      |
+                         | (Object Storage)  |     | Worker (Cron) |
+                         +-------------------+     +----------------+
+------------------------------------------------------------------------------------------------
+
+Key Components
+----------------
+
+Proxy Service
+
+Read Path: Checks hot tier first; falls back to cold tier if not found.
+
+Write Path: Always writes to the hot tier.
+
+No API Changes: Maintains identical request/response formats.
+
+Cold Tier (Object Storage)
+
+Use infrequent-access storage (e.g., S3 Glacier Instant Retrieval, retrieval latency <5 sec).
+
+Cost: ~$0.004/GB/month vs. ~$0.15/GB/month for hot storage.
+
+Archival Worker
+
+Moves records >6 months old to cold storage daily.
+
+Validates data integrity before deleting from the hot tier.
+
+Data Locator
+
+Uses record ID as object key in cold storage (no extra metadata needed).
+
+Workflow
+--------------
+Write: Proxy -> Hot Tier
+
+Read (Recent): Proxy -> Hot Tier -> Client
+
+Read (Archived): Proxy -> Hot Tier (miss) -> Cold Tier -> Client
+
+Archival: Worker: Hot Tier -> Cold Tier -> Delete from Hot
+------------------------------------------------------------------------------------------
+
+
+Implementation Plan
+---------------------------------
+
+1. Proxy Service (Pseudocode)
+-------------------------------
+
+# Read Operation
+def get_record(record_id):
+    # Try hot tier first
+    record = hot_tier_db.query("SELECT data FROM records WHERE id=?", record_id)
+    If record:
+        return record
+    
+    # Fallback to cold tier
+    record = cold_storage.get(record_id)
+    If record:
+        return record
+    else:
+        raise RecordNotFoundError()
+
+# Write Operation
+def save_record(record_id, data):
+    hot_tier_db.execute("INSERT INTO records (id, data) VALUES (?, ?)", record_id, data)
+
+2. Archival Worker (Pseudocode)
+----------------------------------
+
+# Run daily via cron
+for record in hot_tier_db.query("SELECT * FROM records WHERE created_at < NOW() - INTERVAL '6 months'"):
+    # Upload to cold storage
+    cold_storage.upload(record.id, record.data)
+    
+    # Verify upload integrity
+    if cold_storage.validate(record.id, record.data):
+        hot_tier_db.delete(record.id)
+    else:
+        alert_admin("Upload failed: " + record.id)
+
+3. Cold Storage Setup (AWS S3 Example)
+-------------------------------------------
+
+ # Create a bucket with a lifecycle rule
+aws s3api create-bucket --bucket my-cold-storage
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket my-cold-storage \
+  --lifecycle-configuration '{
+    "Rules": [{
+      "ID": "ArchiveImmediately",
+      "Status": "Enabled",
+      "Prefix": "",
+      "Transitions": [{
+        "Days": 0,
+        "StorageClass": "GLACIER_IR"
+      }]
+    }]
+  }'
+
+4. Deployment Steps
+---------------------
+
+Phase 1: Setup (Zero Downtime)
+
+Deploy the proxy service alongside the existing DB
+
+Redirect API traffic to proxy via load balancer (blue-green deploy)
+
+Phase 2: Data Migration
+
+Run the archival worker during off-peak hours
+
+Move ~1,400,000 records (70% of 2M) to cold storage
+
+Storage Savings:
+600 GB * (0.15 - 0.004)/GB/mo = $87.60/month saved
+
+Phase 3: Validation
+
+Verify all records accessible via proxy
+
+Monitor latency: <3 sec for cold records
+----------------------------------------------------------------------------------------------------------
+
+Benefits
+-----------
+Cost Reduction:
+----------------
+
+Hot tier reduced by 70%: 600 GB → 180 GB
+
+Estimated savings: $100+/month (varies by cloud provider)
+
+No Disruptions:
+---------------
+
+Proxy maintains API compatibility
+
+Archival runs as a background process
+
+Latency Compliance:
+--------------------
+
+Cold retrievals under 5 sec (S3 Glacier IR)
+
+Simplicity:
+-----------
+
+No schema changes
+
+Uses managed services (S3, Cron)
+-------------------------------------------------------------------------------------------------------------------
+
+Validation Metrics
+----------------------
+Data Integrity: Checksum verification during archival
+
+Latency: 99th percentile <3 sec for cold reads
+
+Completeness: All 2M records are accessible post-migration
+
+This solution meets all requirements while reducing storage costs by >90% for archived data.
